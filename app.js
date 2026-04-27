@@ -1,4 +1,4 @@
-﻿/**
+/**
  * ====================================================================
  * 教材在庫管理システム - data.js マスタ利用版 (app.js)
  * ====================================================================
@@ -41,8 +41,6 @@ const CARD_LONG_PRESS_MS = 450;
 const SYNTHETIC_CLICK_GUARD_MS = 500;
 
 const INFO_MESSAGES = {
-  LOCAL_PREVIEW: "ローカル確認用です。Firestore保存は行いません。",
-  LOCAL_PREVIEW_NO_TOKEN: "ローカル確認用です。保存は行いません。",
   LOADING: "データ同期中...",
   LOAD_DONE: "同期完了",
   NO_CHANGES: "変更はありません。",
@@ -55,7 +53,6 @@ const INFO_MESSAGES = {
 
 const ERROR_MESSAGES = {
   INVALID_URL: "URLが無効です。",
-  TOKEN_MISSING: "URLが無効です。token がありません。",
   DISABLED_URL: "このURLは現在無効です。",
   ACCESS_CHECK_FAILED: "アクセス確認に失敗しました。通信状態をご確認ください。",
   LOAD_FAILED: "データ取得に失敗しました。",
@@ -89,7 +86,6 @@ const state = {
   autoSaveMaxTimerId: null,
   autoSaveSuspended: false,
   hasShownRetryNotice: false,
-  isLocalPreview: false,
   accessReady: false,
   accessGranted: false,
   tokenDocExists: false,
@@ -115,86 +111,22 @@ let lastMousePressItemId = "";
 let lastMousePressDurationMs = Number.POSITIVE_INFINITY;
 let ignoreClickUntil = 0;
 let lockedBodyScrollY = 0;
+let activeSavePromise = null;
 
-function isPrivateIpv4Host(hostname) {
-  if (!hostname) return false;
-
-  const parts = hostname.split(".");
-  if (parts.length !== 4) return false;
-  if (parts.some((part) => !/^\d+$/.test(part))) return false;
-
-  const octets = parts.map((part) => Number(part));
-  if (octets.some((octet) => octet < 0 || octet > 255)) return false;
-
-  return (
-    octets[0] === 10 ||
-    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
-    (octets[0] === 192 && octets[1] === 168) ||
-    (octets[0] === 169 && octets[1] === 254)
-  );
-}
-
-function isLocalPreviewHost(hostname) {
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    isPrivateIpv4Host(hostname)
-  );
+function redirectToInvalidUrl() {
+  location.replace("./invalid-url.html");
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
   const params = new URLSearchParams(location.search);
   state.token = (params.get("token") || "").trim();
 
-  state.isLocalPreview =
-    location.protocol === "file:" || isLocalPreviewHost(location.hostname);
+  if (!state.token) {
+    redirectToInvalidUrl();
+    return;
+  }
 
   initUI();
-
-  if (!state.token) {
-    const fallbackMasterData = getFallbackMasterData();
-    buildStateFromSources(fallbackMasterData, new Map());
-    generateCategoryChips();
-    syncInputOnlyToggleUI();
-    applyFilterAndRender();
-    updateStatsUI();
-
-    if (state.isLocalPreview) {
-      setInfoMessage(
-        "ローカル確認モードです。見た目と操作感を確認できます。Firestore保存は行いません。",
-        false,
-      );
-      clearErrorMessage();
-      setReadOnlyMode(false);
-    } else {
-      setInfoMessage(ERROR_MESSAGES.TOKEN_MISSING);
-      setErrorMessage(ERROR_MESSAGES.INVALID_URL);
-      setReadOnlyMode(true);
-    }
-    return;
-  }
-
-  if (state.isLocalPreview) {
-    state.roomLabel = "ローカル確認用";
-    updateRoomLabel();
-
-    const fallbackMasterData = getFallbackMasterData();
-    buildStateFromSources(fallbackMasterData, new Map());
-    generateCategoryChips();
-    syncInputOnlyToggleUI();
-    applyFilterAndRender();
-    updateStatsUI();
-
-    setInfoMessage(
-      "ローカル確認モードです。見た目と操作感を確認できます。Firestore保存は行いません。",
-      false,
-    );
-    clearErrorMessage();
-    setReadOnlyMode(false);
-    return;
-  }
-
   await initAccessAndLoad();
 });
 
@@ -210,8 +142,6 @@ function initUI() {
   if (roomLabelEl) {
     if (state.roomLabel) {
       roomLabelEl.textContent = state.roomLabel;
-    } else if (state.isLocalPreview) {
-      roomLabelEl.textContent = "ローカル確認用";
     } else {
       roomLabelEl.textContent = "確認中";
       roomLabelEl.classList.add("muted");
@@ -258,6 +188,10 @@ function initUI() {
 
     generateCategoryChips();
     applyFilterAndRender();
+  });
+
+  filterArea?.addEventListener("scroll", syncFilterOverflowHint, {
+    passive: true,
   });
 
   inputOnlyToggle?.addEventListener("click", () => {
@@ -390,7 +324,10 @@ function initUI() {
   attachDialogBackdropClose("customItemDialog");
 
   document.addEventListener("click", handleDocumentClickForCopyPopover);
-  window.addEventListener("resize", closeCopyPopover);
+  window.addEventListener("resize", () => {
+    closeCopyPopover();
+    syncFilterOverflowHint();
+  });
   window.addEventListener("scroll", closeCopyPopover, true);
 }
 
@@ -627,6 +564,7 @@ function clearLocalLogs() {
   } catch (err) {
     console.warn("ローカルログの削除に失敗:", err);
   }
+  clearInventoryCache(state.token);
   renderLocalLogsDialog();
 }
 
@@ -657,11 +595,13 @@ function isInventoryCompleted() {
 
 function getCompletionInfoMessage() {
   const completedAtLabel = formatTimestamp(state.completedAt);
-  if (!completedAtLabel) {
-    return "本部への送信が完了しています。再編集を希望する場合、教務本部までご連絡ください。";
-  }
+  if (!completedAtLabel) return "本部送信済み";
 
-  return `本部への送信が完了しています。再編集を希望する場合、教務本部までご連絡ください。 / 本部送信: ${completedAtLabel}`;
+  return `本部送信: ${completedAtLabel}`;
+}
+
+function getCompletionFooterMeta() {
+  return "再編集を希望する場合、教務本部までご連絡ください。";
 }
 
 function updateInfoBanner(message = "") {
@@ -732,15 +672,8 @@ function syncTokenState(tokenData = null) {
 }
 
 function syncCompletionUI() {
-  const completeBtn = document.getElementById("completeInventoryBtn");
-  const completionCta = document.getElementById("completionCta");
   const completeStatus = document.getElementById("completeInventoryStatus");
-  const sendBtn = document.getElementById("sendBtn");
   const backupMenuGroup = document.getElementById("backupMenuGroup");
-
-  if (completeBtn) {
-    completeBtn.disabled = state.isCompleting || state.isSyncing;
-  }
 
   if (completeStatus) {
     completeStatus.hidden = true;
@@ -766,9 +699,7 @@ async function initAccessAndLoad() {
     if (!tokenSnap.exists()) {
       setReadOnlyMode(true);
       syncCompletionUI();
-      setErrorMessage(ERROR_MESSAGES.INVALID_URL);
-      renderEmptyMessage(ERROR_MESSAGES.INVALID_URL);
-      updateStatsUI();
+      redirectToInvalidUrl();
       return;
     }
 
@@ -832,7 +763,6 @@ function updatePageTitle() {
 }
 
 function canEdit() {
-  if (state.isLocalPreview) return !isInventoryCompleted();
   return !!(state.token && state.accessGranted && !isInventoryCompleted());
 }
 
@@ -1180,31 +1110,29 @@ function buildConflictMessage(conflictNames) {
 }
 
 async function handleCompleteInventory() {
-  if (state.isSyncing || state.isCompleting || isInventoryCompleted()) {
+  if (state.isCompleting || isInventoryCompleted()) {
     return;
   }
 
-  if (!state.isLocalPreview && (!state.token || !state.accessGranted)) {
+  if (!state.token || !state.accessGranted) {
     return;
   }
 
   const confirmed = confirm(
-    "【棚卸完了】\n棚卸結果を本部へ送信しますか？\n（すべての在庫入力を終えてから実行してください）\n\n送信後は、入力内容を変更できなくなります。\n棚卸が完了していない場合は、キャンセルを押してください。",
+    "【棚卸完了】\n棚卸結果を本部へ送信しますか？\n（すべての在庫入力を終えてから実行してください）\n\n送信後は、入力内容を変更できなくなります。\n棚卸が完了していない場合は、キャンセルを押してください。\n\n※未保存の変更がある場合は、保存後に本部へ送信されます。",
   );
   if (!confirmed) return;
 
-  if (state.isLocalPreview) {
-    state.completedAt = {
-      toDate() {
-        return new Date();
-      },
-    };
-    clearErrorMessage();
-    closeModal("toolMenuDialog");
-    setReadOnlyMode(true);
-    updateInfoBanner();
-    addLocalLog("info", "棚卸結果を本部に送信しました");
-    return;
+  if (state.isSyncing && activeSavePromise) {
+    setInfoMessage("保存完了を待っています...", false);
+    const currentSaveSucceeded = await activeSavePromise;
+    if (!currentSaveSucceeded && state.dirtyCount === 0) {
+      setInfoMessage(
+        "保存処理で問題が発生したため、本部への送信を中止しました。",
+        false,
+      );
+      return;
+    }
   }
 
   if (state.dirtyCount > 0) {
@@ -1264,24 +1192,27 @@ async function handleCompleteInventory() {
   }
 }
 
-async function sendData({
+function sendData(options = {}) {
+  if (state.isSyncing) {
+    return activeSavePromise || Promise.resolve(false);
+  }
+
+  const savePromise = performSendData(options);
+  const trackedSavePromise = savePromise.finally(() => {
+    if (activeSavePromise === trackedSavePromise) {
+      activeSavePromise = null;
+    }
+  });
+  activeSavePromise = trackedSavePromise;
+  return trackedSavePromise;
+}
+
+async function performSendData({
   silent = false,
   isManualRetry = false,
   requireClean = false,
 } = {}) {
-  if (state.isLocalPreview) {
-    clearErrorMessage();
-    setInfoMessage(
-      silent
-        ? "ローカル確認モードです。保存送信は行いません。"
-        : "ローカル確認モードです。Firestore保存は行いません。",
-      false,
-    );
-    clearAutoSaveTimer();
-    return true;
-  }
-
-  if (!state.token || state.isSyncing || !canEdit()) return false;
+  if (!state.token || !canEdit()) return false;
 
   const dirtyItems = state.items.filter(
     (item) => snapshotKey(item) !== state.originalSnapshotMap[item.id],
@@ -1517,6 +1448,31 @@ function generateCategoryChips() {
   `;
 
   container.innerHTML = html;
+  requestAnimationFrame(() => {
+    syncFilterOverflowHint();
+  });
+}
+
+function syncFilterOverflowHint() {
+  const filterArea = document.getElementById("filterArea");
+  const filterLayout = document.querySelector(".filter-layout");
+  if (!filterArea || !filterLayout) return;
+
+  const maxScrollLeft = Math.max(
+    0,
+    filterArea.scrollWidth - filterArea.clientWidth,
+  );
+  const hasOverflow = maxScrollLeft > 4;
+  const hasLeftOverflow = hasOverflow && filterArea.scrollLeft > 4;
+  const hasRightOverflow =
+    hasOverflow && filterArea.scrollLeft < maxScrollLeft - 4;
+
+  filterLayout.classList.toggle("has-filter-overflow", hasOverflow);
+  filterLayout.classList.toggle("has-filter-overflow-left", hasLeftOverflow);
+  filterLayout.classList.toggle(
+    "has-filter-overflow-right",
+    hasRightOverflow,
+  );
 }
 
 function applyFilterAndRender() {
@@ -1666,7 +1622,13 @@ function normalizeItem(raw) {
     isCustom: !!raw.isCustom,
   };
 
-  item.searchTag = [
+  item.searchTag = buildItemSearchTag(item);
+
+  return item;
+}
+
+function buildItemSearchTag(item) {
+  return [
     item.name,
     item.category,
     item.subject,
@@ -1676,8 +1638,6 @@ function normalizeItem(raw) {
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
-
-  return item;
 }
 
 function getDisplayItemName(item) {
@@ -1759,18 +1719,30 @@ function updateStatsUI() {
 function updateFooterActions() {
   const dirtyCountEl = document.getElementById("dirtyCount");
   const saveStatusEl = document.querySelector(".save-status");
+  const bottomInner = document.querySelector(".bottom-inner");
   const bottomActions = document.querySelector(".bottom-actions");
+  const completionNotice = document.getElementById("completionNotice");
+  const completionNoticeMeta = document.getElementById("completionNoticeMeta");
   const sendBtn = document.getElementById("sendBtn");
-  const completeBtn = document.getElementById("completeInventoryBtn");
-  const canShowComplete = state.isLocalPreview
-    ? !isInventoryCompleted()
-    : !!state.token && state.accessGranted && !isInventoryCompleted();
   const hasDirty = state.dirtyCount > 0;
   const isBusy = state.isSyncing || state.isCompleting;
+  const isCompleted = isInventoryCompleted();
+
+  bottomInner?.classList.toggle("is-completed", isCompleted);
+  saveStatusEl?.toggleAttribute("hidden", isCompleted);
+
+  if (completionNotice) {
+    completionNotice.hidden = !isCompleted;
+  }
+
+  if (completionNoticeMeta) {
+    completionNoticeMeta.textContent = isCompleted
+      ? getCompletionFooterMeta()
+      : "";
+  }
 
   if (dirtyCountEl && saveStatusEl) {
-    if (isInventoryCompleted()) {
-      dirtyCountEl.textContent = "本部送信完了";
+    if (isCompleted) {
       saveStatusEl.dataset.state = "completed";
     } else if (state.isCompleting) {
       dirtyCountEl.textContent = "本部へ送信中…";
@@ -1798,10 +1770,6 @@ function updateFooterActions() {
     sendBtn.textContent = "保存";
     sendBtn.classList.toggle("dirty", hasDirty);
     sendBtn.disabled = !hasDirty || isBusy || !canEdit();
-  }
-
-  if (completeBtn) {
-    completeBtn.disabled = !canShowComplete || isBusy;
   }
 }
 
@@ -2417,16 +2385,7 @@ async function importJsonBackup(e) {
             target.edition = importedItem.edition || target.edition;
           }
 
-          target.searchTag = [
-            target.name,
-            target.category,
-            target.subject,
-            target.publisher,
-            target.edition,
-          ]
-            .filter(Boolean)
-            .join(" ")
-            .toLowerCase();
+          target.searchTag = buildItemSearchTag(target);
         } else if (importedItem.isCustom) {
           pushNewDirtyItemToState(
             normalizeItem({
@@ -2681,16 +2640,7 @@ function handleCustomItemSubmit(e) {
     target.publisher = publisher;
     target.edition = edition;
     target.qty = qty;
-    target.searchTag = [
-      target.name,
-      target.category,
-      target.subject,
-      target.publisher,
-      target.edition,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
+    target.searchTag = buildItemSearchTag(target);
   } else {
     const id = "custom_" + Date.now();
 
